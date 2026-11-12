@@ -1,0 +1,27 @@
+{
+  "name": "@llazyemail/generate-template-server",
+  "version": "0.1.0",
+  "description": "Thin callable HTTP server that wraps @llazyemail/generate-template.run. For online editors, preview, and zip-download flows.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "main": "./src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test src/server.test.mjs"
+  },
+  "dependencies": {
+    "@llazyemail/generate-template": "^1.9.1",
+    "archiver": "^7.0.1"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LLazyEmail/generate-template-server.git"
+  }
+}
