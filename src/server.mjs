@@ -4,6 +4,7 @@
  *
  * Contract:
  *   POST /render          { templateId, payload? }           → { html, templateId, ... }
+ *   POST /render-preview  { templateId, payload? }           → text/html (for iframes)
  *   POST /render-many     { items: [{ templateId, payload }] } → zip stream (or JSON if Accept: application/json)
  *   GET  /templates        list available template ids
  *   GET  /health           { ok: true }
@@ -36,6 +37,17 @@ function json(res, status, body) {
   res.end(data);
 }
 
+function html(res, status, content) {
+  const data = Buffer.from(content, 'utf8');
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': data.length,
+    'access-control-allow-origin': '*',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; img-src data: https:;",
+  });
+  res.end(data);
+}
+
 async function readBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -47,6 +59,10 @@ async function readBody(req) {
   }
 }
 
+async function runOne(templateId, payload) {
+  return generate.run({ templateId, payload });
+}
+
 async function handleRender(req, res) {
   const body = await readBody(req);
   if (body === null) return json(res, 400, { error: 'invalid_json' });
@@ -54,16 +70,31 @@ async function handleRender(req, res) {
   if (!templateId) return json(res, 400, { error: 'templateId_required' });
 
   try {
-    const result = await generate.run({
-      templateId,
-      payload: body.payload,
-    });
+    const result = await runOne(templateId, body.payload);
     return json(res, 200, {
       templateId: result.templateId ?? templateId,
       html: result.html,
-      // pass through useful metadata when present
       slug: result.slug,
     });
+  } catch (err) {
+    const code = err?.code ?? 'RENDER_FAILED';
+    const status = code === 'UNKNOWN_TEMPLATE' ? 404 : 422;
+    return json(res, status, {
+      error: code,
+      message: err?.message ?? String(err),
+    });
+  }
+}
+
+async function handleRenderPreview(req, res) {
+  const body = await readBody(req);
+  if (body === null) return json(res, 400, { error: 'invalid_json' });
+  const templateId = body.templateId;
+  if (!templateId) return json(res, 400, { error: 'templateId_required' });
+
+  try {
+    const result = await runOne(templateId, body.payload);
+    return html(res, 200, result.html ?? '');
   } catch (err) {
     const code = err?.code ?? 'RENDER_FAILED';
     const status = code === 'UNKNOWN_TEMPLATE' ? 404 : 422;
@@ -84,10 +115,7 @@ async function handleRenderMany(req, res) {
   for (const item of items) {
     if (!item?.templateId) continue;
     try {
-      const result = await generate.run({
-        templateId: item.templateId,
-        payload: item.payload,
-      });
+      const result = await runOne(item.templateId, item.payload);
       rendered.push({
         name: `${result.slug ?? item.templateId}.html`,
         html: result.html,
@@ -106,7 +134,6 @@ async function handleRenderMany(req, res) {
     return json(res, 200, { files: rendered });
   }
 
-  // Default: zip download (matches the online-editor “hit download” flow)
   res.writeHead(200, {
     'content-type': 'application/zip',
     'content-disposition': 'attachment; filename="templates.zip"',
@@ -125,7 +152,6 @@ async function handleRenderMany(req, res) {
 }
 
 async function handleTemplates(_req, res) {
-  // Lightweight listing — full catalog introspection can be added later
   const ids = demoCatalog.flatMap((c) => c.ids);
   return json(res, 200, { templates: ids, samples: Object.keys(samplePayloads) });
 }
@@ -151,6 +177,9 @@ const server = createServer(async (req, res) => {
   }
   if (method === 'POST' && url.pathname === '/render') {
     return handleRender(req, res);
+  }
+  if (method === 'POST' && url.pathname === '/render-preview') {
+    return handleRenderPreview(req, res);
   }
   if (method === 'POST' && url.pathname === '/render-many') {
     return handleRenderMany(req, res);
