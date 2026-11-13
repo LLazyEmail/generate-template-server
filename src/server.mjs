@@ -6,13 +6,15 @@
  *   POST /render           { templateId, payload? } → JSON { html, ... }
  *   POST /render-preview   { templateId, payload? } → text/html (iframe)
  *   POST /render-many      { items, parallel? }     → zip or JSON
+ *   POST /download         { items?, templateIds?, all?, includeIndex?, artifactName? }
+ *                          → zip (mirrors email-template-workflows zip-artifact)
  *   GET  /templates
- *   GET  /templates/:id    existence + sample presence
- *   GET  /samples/:id      sample payload
- *   GET  /health           { ok, version, uptime }
+ *   GET  /templates/:id
+ *   GET  /samples/:id
+ *   GET  /health
  *   GET  /version
  *   GET  /docs
- *   GET  /openapi.json     OpenAPI 3 stub
+ *   GET  /openapi.json
  *   GET  /metrics
  *   GET  /recent
  *
@@ -23,7 +25,6 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { createGenerator } from '@llazyemail/generate-template';
 import archiver from 'archiver';
-import { demoCatalog, samplePayloads } from './catalog.mjs';
 import { checkRateLimit } from './rate-limit.mjs';
 import { toHttpError } from './errors.mjs';
 import { config } from './config.mjs';
@@ -31,12 +32,24 @@ import { inc, snapshot } from './metrics.mjs';
 import { record, list as recentList } from './recent.mjs';
 import { withTimeout } from './timeout.mjs';
 import { logRequest, logError } from './logger.mjs';
+import { loadCatalog } from './load-catalog.mjs';
+import { requireAuth, isPublicPath } from './auth.mjs';
+import { buildIndex, sendZip } from './download.mjs';
 
 const startedAt = Date.now();
-const generate = createGenerator({
-  catalog: demoCatalog,
-  samplePayloads,
-});
+
+let generate;
+let catalog = [];
+let samplePayloads = {};
+let catalogSource = 'loading';
+
+async function init() {
+  const loaded = await loadCatalog();
+  catalog = loaded.catalog;
+  samplePayloads = loaded.samplePayloads;
+  catalogSource = loaded.source;
+  generate = createGenerator({ catalog, samplePayloads });
+}
 
 const ENDPOINTS = [
   { method: 'GET', path: '/health', auth: false, desc: 'liveness + uptime' },
@@ -51,6 +64,7 @@ const ENDPOINTS = [
   { method: 'POST', path: '/render', auth: true, desc: 'JSON HTML' },
   { method: 'POST', path: '/render-preview', auth: true, desc: 'raw HTML for iframe' },
   { method: 'POST', path: '/render-many', auth: true, desc: 'zip or JSON; optional parallel' },
+  { method: 'POST', path: '/download', auth: true, desc: 'zip of files + optional index (workflows-compatible)' },
 ];
 
 function json(res, status, body, extra = {}) {
@@ -114,7 +128,11 @@ function findSample(id) {
 
 function templateExists(id) {
   const lower = String(id).toLowerCase();
-  return demoCatalog.some((c) => c.ids.some((i) => i.toLowerCase() === lower));
+  return catalog.some((c) => c.ids.some((i) => i.toLowerCase() === lower));
+}
+
+function allTemplateIds() {
+  return catalog.flatMap((c) => c.ids);
 }
 
 async function handleRender(req, res, reqId) {
@@ -225,6 +243,70 @@ async function handleRenderMany(req, res, reqId) {
   inc('zips');
 }
 
+/**
+ * Dedicated download path.
+ * Body:
+ *   { items?: [{templateId, payload?}], templateIds?: string[], all?: boolean,
+ *     includeIndex?: boolean, artifactName?: string, productName?: string }
+ * Returns a zip. When includeIndex is true (default), an index.html is added
+ * so the archive matches the shape produced by email-template-workflows
+ * with zip-artifact: true.
+ */
+async function handleDownload(req, res, reqId) {
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (err) {
+    const { status, body: errBody } = toHttpError(err);
+    return json(res, status, { ...errBody, reqId });
+  }
+  if (body === null) return json(res, 400, { error: 'invalid_json', reqId });
+
+  let ids = [];
+  if (body.all) {
+    ids = allTemplateIds();
+  } else if (Array.isArray(body.templateIds)) {
+    ids = body.templateIds;
+  } else if (Array.isArray(body.items)) {
+    ids = body.items.map((i) => i.templateId).filter(Boolean);
+  }
+
+  if (ids.length === 0) {
+    return json(res, 400, { error: 'nothing_to_render', reqId });
+  }
+
+  const files = [];
+  for (const id of ids) {
+    const item = Array.isArray(body.items)
+      ? body.items.find((i) => i.templateId === id)
+      : null;
+    const payload = item?.payload ?? findSample(id);
+    try {
+      const result = await runOne(id, payload);
+      const name = `${result.slug ?? id}.html`;
+      files.push({ name, content: result.html ?? '' });
+      record({ templateId: id, reqId, slug: result.slug, download: true });
+    } catch (err) {
+      inc('render_errors');
+      const { status, body: errBody } = toHttpError(err);
+      return json(res, status, { ...errBody, templateId: id, reqId });
+    }
+  }
+
+  const includeIndex = body.includeIndex !== false;
+  const productName = body.productName || 'files';
+  if (includeIndex) {
+    files.unshift({
+      name: 'index.html',
+      content: buildIndex(files, productName),
+    });
+  }
+
+  const artifactName = body.artifactName || 'rendered';
+  inc('downloads');
+  sendZip(res, files, artifactName, config.corsOrigin);
+}
+
 async function sequential(tasks) {
   const out = [];
   for (const t of tasks) out.push(await t);
@@ -232,8 +314,12 @@ async function sequential(tasks) {
 }
 
 function handleTemplates(_req, res) {
-  const ids = demoCatalog.flatMap((c) => c.ids);
-  return json(res, 200, { templates: ids, samples: Object.keys(samplePayloads) });
+  const ids = allTemplateIds();
+  return json(res, 200, {
+    templates: ids,
+    samples: Object.keys(samplePayloads),
+    catalogSource,
+  });
 }
 
 function handleTemplateById(id, res) {
@@ -303,6 +389,7 @@ const server = createServer(async (req, res) => {
       service: 'generate-template-server',
       version: config.version,
       uptime: Math.floor((Date.now() - startedAt) / 1000),
+      catalogSource,
     });
   }
   if (method === 'GET' && url.pathname === '/version') {
@@ -314,6 +401,8 @@ const server = createServer(async (req, res) => {
   if (method === 'GET' && url.pathname === '/openapi.json') {
     return json(res, 200, openApiStub());
   }
+
+  if (!isPublicPath(url.pathname) && !requireAuth(req, res)) return;
 
   if (!checkRateLimit(req, res)) {
     inc('rate_limited');
@@ -336,15 +425,23 @@ const server = createServer(async (req, res) => {
   if (method === 'POST' && url.pathname === '/render') return handleRender(req, res, reqId);
   if (method === 'POST' && url.pathname === '/render-preview') return handleRenderPreview(req, res, reqId);
   if (method === 'POST' && url.pathname === '/render-many') return handleRenderMany(req, res, reqId);
+  if (method === 'POST' && url.pathname === '/download') return handleDownload(req, res, reqId);
 
   return json(res, 404, { error: 'not_found', path: url.pathname, reqId });
 });
 
-server.listen(config.port, config.host, () => {
-  console.log(
-    `generate-template-server ${config.version} listening on http://${config.host}:${config.port}`,
-  );
-});
+init()
+  .then(() => {
+    server.listen(config.port, config.host, () => {
+      console.log(
+        `generate-template-server ${config.version} listening on http://${config.host}:${config.port} (catalog: ${catalogSource})`,
+      );
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to start:', err);
+    process.exit(1);
+  });
 
 function shutdown() {
   console.log('shutting down');

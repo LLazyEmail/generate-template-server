@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure GitHub Packages auth
+        run: |
+          echo "@llazyemail:registry=https://npm.pkg.github.com" >> .npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> .npmrc
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm install
+
+      - name: Fallback — public deps only
+        if: steps.install.outcome == 'failure'
+        run: |
+          echo "::warning::@llazyemail/generate-template is not readable by this repo's GITHUB_TOKEN. Running pure unit tests only. See docs/ci-packages.md"
+          # Isolate so npm does not try to resolve the private package
+          mv package.json package.json.orig
+          cat > package.json << 'EOF'
+          { "type": "module", "dependencies": { "archiver": "^7.0.1" } }
+          EOF
+          npm install --registry https://registry.npmjs.org
+          mv package.json.orig package.json
+
+      - name: Run pure unit tests
+        run: npm run test:ci
+
+      - name: Run full tests (when private package is available)
+        if: steps.install.outcome == 'success'
+        run: npm test
