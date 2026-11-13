@@ -4,7 +4,13 @@
  */
 const API_KEY = process.env.API_KEY;
 
-const PUBLIC_PATHS = new Set(['/health', '/version', '/docs', '/openapi.json']);
+const PUBLIC_PATHS = new Set([
+  '/health',
+  '/version',
+  '/docs',
+  '/openapi.json',
+  '/demo',
+]);
 
 export function isPublicPath(pathname) {
   return PUBLIC_PATHS.has(pathname);
