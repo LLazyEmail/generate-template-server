@@ -1,26 +1,8 @@
 #!/usr/bin/env node
 /**
  * Thin callable HTTP server.
- *
- * Endpoints:
- *   POST /render           { templateId, payload? } → JSON { html, ... }
- *   POST /render-preview   { templateId, payload? } → text/html (iframe)
- *   POST /render-many      { items, parallel? }     → zip or JSON
- *   POST /download         { items?, templateIds?, all?, includeIndex?, artifactName? }
- *                          → zip (mirrors email-template-workflows zip-artifact)
- *   GET  /templates
- *   GET  /templates/:id
- *   GET  /samples/:id
- *   GET  /health
- *   GET  /version
- *   GET  /docs
- *   GET  /openapi.json
- *   GET  /metrics
- *   GET  /recent
- *
- * Generation stays in `@llazyemail/generate-template`.
+ * Adds POST /reload to hot-reload the catalog without restart.
  */
-
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { createGenerator } from '@llazyemail/generate-template';
@@ -35,20 +17,13 @@ import { logRequest, logError } from './logger.mjs';
 import { loadCatalog } from './load-catalog.mjs';
 import { requireAuth, isPublicPath } from './auth.mjs';
 import { buildIndex, sendZip } from './download.mjs';
+import { reloadCatalog } from './reload.mjs';
 
 const startedAt = Date.now();
-
-let generate;
-let catalog = [];
-let samplePayloads = {};
-let catalogSource = 'loading';
+const state = { generate: null, catalog: [], samplePayloads: {}, catalogSource: 'loading' };
 
 async function init() {
-  const loaded = await loadCatalog();
-  catalog = loaded.catalog;
-  samplePayloads = loaded.samplePayloads;
-  catalogSource = loaded.source;
-  generate = createGenerator({ catalog, samplePayloads });
+  await reloadCatalog(state);
 }
 
 const ENDPOINTS = [
@@ -61,10 +36,11 @@ const ENDPOINTS = [
   { method: 'GET', path: '/samples/:id', auth: true, desc: 'sample payload' },
   { method: 'GET', path: '/metrics', auth: true, desc: 'counters' },
   { method: 'GET', path: '/recent', auth: true, desc: 'recent renders' },
+  { method: 'POST', path: '/reload', auth: true, desc: 'hot-reload catalog' },
   { method: 'POST', path: '/render', auth: true, desc: 'JSON HTML' },
   { method: 'POST', path: '/render-preview', auth: true, desc: 'raw HTML for iframe' },
-  { method: 'POST', path: '/render-many', auth: true, desc: 'zip or JSON; optional parallel' },
-  { method: 'POST', path: '/download', auth: true, desc: 'zip of files + optional index (workflows-compatible)' },
+  { method: 'POST', path: '/render-many', auth: true, desc: 'zip or JSON' },
+  { method: 'POST', path: '/download', auth: true, desc: 'zip of files + optional index' },
 ];
 
 function json(res, status, body, extra = {}) {
@@ -77,7 +53,6 @@ function json(res, status, body, extra = {}) {
   });
   res.end(data);
 }
-
 function html(res, status, content) {
   const data = Buffer.from(content, 'utf8');
   res.writeHead(status, {
@@ -88,7 +63,6 @@ function html(res, status, content) {
   });
   res.end(data);
 }
-
 async function readBody(req) {
   const chunks = [];
   let total = 0;
@@ -103,251 +77,117 @@ async function readBody(req) {
     chunks.push(c);
   }
   if (chunks.length === 0) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
 }
-
 async function runOne(templateId, payload) {
-  const result = await withTimeout(
-    generate.run({ templateId, payload }),
-    `render ${templateId}`,
-  );
+  const result = await withTimeout(state.generate.run({ templateId, payload }), `render ${templateId}`);
   inc('renders');
   return result;
 }
-
 function findSample(id) {
-  const key = Object.keys(samplePayloads).find(
-    (k) => k.toLowerCase() === String(id).toLowerCase(),
-  );
-  return key ? samplePayloads[key] : undefined;
+  const key = Object.keys(state.samplePayloads).find((k) => k.toLowerCase() === String(id).toLowerCase());
+  return key ? state.samplePayloads[key] : undefined;
 }
-
 function templateExists(id) {
   const lower = String(id).toLowerCase();
-  return catalog.some((c) => c.ids.some((i) => i.toLowerCase() === lower));
+  return state.catalog.some((c) => c.ids.some((i) => i.toLowerCase() === lower));
 }
+function allTemplateIds() { return state.catalog.flatMap((c) => c.ids); }
 
-function allTemplateIds() {
-  return catalog.flatMap((c) => c.ids);
-}
-
-async function handleRender(req, res, reqId) {
-  let body;
+async function handleReload(req, res, reqId) {
   try {
-    body = await readBody(req);
+    const info = await reloadCatalog(state);
+    return json(res, 200, { ...info, reqId });
   } catch (err) {
-    const { status, body: errBody } = toHttpError(err);
-    return json(res, status, { ...errBody, reqId });
+    const { status, body } = toHttpError(err);
+    return json(res, status, { ...body, reqId });
   }
+}
+async function handleRender(req, res, reqId) {
+  const body = await readBody(req);
   if (body === null) return json(res, 400, { error: 'invalid_json', reqId });
-  const templateId = body.templateId;
-  if (!templateId) return json(res, 400, { error: 'templateId_required', reqId });
-
+  if (!body.templateId) return json(res, 400, { error: 'templateId_required', reqId });
   try {
-    const result = await runOne(templateId, body.payload);
-    record({ templateId, reqId, slug: result.slug });
-    return json(res, 200, {
-      templateId: result.templateId ?? templateId,
-      html: result.html,
-      slug: result.slug,
-      reqId,
-    });
+    const result = await runOne(body.templateId, body.payload);
+    record({ templateId: body.templateId, reqId, slug: result.slug });
+    return json(res, 200, { templateId: result.templateId ?? body.templateId, html: result.html, slug: result.slug, reqId });
   } catch (err) {
     inc('render_errors');
-    logError({ reqId, templateId, error: err?.message, code: err?.code });
     const { status, body: errBody } = toHttpError(err);
     return json(res, status, { ...errBody, reqId });
   }
 }
-
 async function handleRenderPreview(req, res, reqId) {
-  let body;
-  try {
-    body = await readBody(req);
-  } catch (err) {
-    const { status, body: errBody } = toHttpError(err);
-    return json(res, status, { ...errBody, reqId });
-  }
+  const body = await readBody(req);
   if (body === null) return json(res, 400, { error: 'invalid_json', reqId });
-  const templateId = body.templateId;
-  if (!templateId) return json(res, 400, { error: 'templateId_required', reqId });
-
+  if (!body.templateId) return json(res, 400, { error: 'templateId_required', reqId });
   try {
-    const result = await runOne(templateId, body.payload);
-    record({ templateId, reqId, slug: result.slug, preview: true });
+    const result = await runOne(body.templateId, body.payload);
     return html(res, 200, result.html ?? '');
   } catch (err) {
-    inc('render_errors');
     const { status, body: errBody } = toHttpError(err);
     return json(res, status, { ...errBody, reqId });
   }
 }
-
 async function handleRenderMany(req, res, reqId) {
-  let body;
-  try {
-    body = await readBody(req);
-  } catch (err) {
-    const { status, body: errBody } = toHttpError(err);
-    return json(res, status, { ...errBody, reqId });
-  }
+  const body = await readBody(req);
   if (body === null) return json(res, 400, { error: 'invalid_json', reqId });
   const items = Array.isArray(body.items) ? body.items : [];
   if (items.length === 0) return json(res, 400, { error: 'items_required', reqId });
-
-  const tasks = items
-    .filter((item) => item?.templateId)
-    .map(async (item) => {
-      const result = await runOne(item.templateId, item.payload);
-      record({ templateId: item.templateId, reqId, slug: result.slug });
-      return {
-        name: `${result.slug ?? item.templateId}.html`,
-        html: result.html,
-      };
-    });
-
+  const tasks = items.filter((i) => i?.templateId).map(async (item) => {
+    const result = await runOne(item.templateId, item.payload);
+    return { name: `${result.slug ?? item.templateId}.html`, html: result.html };
+  });
   let rendered;
-  try {
-    rendered = body.parallel ? await Promise.all(tasks) : await sequential(tasks);
-  } catch (err) {
-    inc('render_errors');
+  try { rendered = body.parallel ? await Promise.all(tasks) : await sequential(tasks); }
+  catch (err) {
     const { status, body: errBody } = toHttpError(err);
     return json(res, status, { ...errBody, reqId });
   }
-
-  const accept = String(req.headers.accept || '');
-  if (accept.includes('application/json')) {
-    return json(res, 200, { files: rendered, reqId });
-  }
-
-  res.writeHead(200, {
-    'content-type': 'application/zip',
-    'content-disposition': 'attachment; filename="artifacts.zip"',
-    'access-control-allow-origin': config.corsOrigin,
-    'x-request-id': reqId,
-  });
+  if (String(req.headers.accept || '').includes('application/json')) return json(res, 200, { files: rendered, reqId });
+  res.writeHead(200, { 'content-type': 'application/zip', 'content-disposition': 'attachment; filename="artifacts.zip"', 'access-control-allow-origin': config.corsOrigin });
   const archive = archiver('zip', { zlib: { level: 9 } });
-  archive.on('error', (e) => {
-    console.error(e);
-    res.destroy(e);
-  });
   archive.pipe(res);
-  for (const f of rendered) {
-    archive.append(f.html, { name: f.name });
-  }
+  for (const f of rendered) archive.append(f.html, { name: f.name });
   archive.finalize();
-  inc('zips');
 }
-
-/**
- * Dedicated download path.
- * Body:
- *   { items?: [{templateId, payload?}], templateIds?: string[], all?: boolean,
- *     includeIndex?: boolean, artifactName?: string, productName?: string }
- * Returns a zip. When includeIndex is true (default), an index.html is added
- * so the archive matches the shape produced by email-template-workflows
- * with zip-artifact: true.
- */
+async function sequential(tasks) { const out = []; for (const t of tasks) out.push(await t); return out; }
 async function handleDownload(req, res, reqId) {
-  let body;
-  try {
-    body = await readBody(req);
-  } catch (err) {
-    const { status, body: errBody } = toHttpError(err);
-    return json(res, status, { ...errBody, reqId });
-  }
+  const body = await readBody(req);
   if (body === null) return json(res, 400, { error: 'invalid_json', reqId });
-
   let ids = [];
-  if (body.all) {
-    ids = allTemplateIds();
-  } else if (Array.isArray(body.templateIds)) {
-    ids = body.templateIds;
-  } else if (Array.isArray(body.items)) {
-    ids = body.items.map((i) => i.templateId).filter(Boolean);
-  }
-
-  if (ids.length === 0) {
-    return json(res, 400, { error: 'nothing_to_render', reqId });
-  }
-
+  if (body.all) ids = allTemplateIds();
+  else if (Array.isArray(body.templateIds)) ids = body.templateIds;
+  else if (Array.isArray(body.items)) ids = body.items.map((i) => i.templateId).filter(Boolean);
+  if (ids.length === 0) return json(res, 400, { error: 'nothing_to_render', reqId });
   const files = [];
   for (const id of ids) {
-    const item = Array.isArray(body.items)
-      ? body.items.find((i) => i.templateId === id)
-      : null;
-    const payload = item?.payload ?? findSample(id);
+    const item = Array.isArray(body.items) ? body.items.find((i) => i.templateId === id) : null;
     try {
-      const result = await runOne(id, payload);
-      const name = `${result.slug ?? id}.html`;
-      files.push({ name, content: result.html ?? '' });
-      record({ templateId: id, reqId, slug: result.slug, download: true });
+      const result = await runOne(id, item?.payload ?? findSample(id));
+      files.push({ name: `${result.slug ?? id}.html`, content: result.html ?? '' });
     } catch (err) {
-      inc('render_errors');
       const { status, body: errBody } = toHttpError(err);
       return json(res, status, { ...errBody, templateId: id, reqId });
     }
   }
-
-  const includeIndex = body.includeIndex !== false;
-  const productName = body.productName || 'files';
-  if (includeIndex) {
-    files.unshift({
-      name: 'index.html',
-      content: buildIndex(files, productName),
-    });
-  }
-
-  const artifactName = body.artifactName || 'rendered';
-  inc('downloads');
-  sendZip(res, files, artifactName, config.corsOrigin);
+  if (body.includeIndex !== false) files.unshift({ name: 'index.html', content: buildIndex(files, body.productName || 'files') });
+  sendZip(res, files, body.artifactName || 'rendered', config.corsOrigin);
 }
-
-async function sequential(tasks) {
-  const out = [];
-  for (const t of tasks) out.push(await t);
-  return out;
-}
-
 function handleTemplates(_req, res) {
-  const ids = allTemplateIds();
-  return json(res, 200, {
-    templates: ids,
-    samples: Object.keys(samplePayloads),
-    catalogSource,
-  });
+  return json(res, 200, { templates: allTemplateIds(), samples: Object.keys(state.samplePayloads), catalogSource: state.catalogSource });
 }
-
 function handleTemplateById(id, res) {
-  const exists = templateExists(id);
-  if (!exists) return json(res, 404, { error: 'UNKNOWN_TEMPLATE', templateId: id });
-  return json(res, 200, {
-    templateId: id,
-    exists: true,
-    hasSample: findSample(id) !== undefined,
-  });
+  if (!templateExists(id)) return json(res, 404, { error: 'UNKNOWN_TEMPLATE', templateId: id });
+  return json(res, 200, { templateId: id, exists: true, hasSample: findSample(id) !== undefined });
 }
-
 function handleSample(id, res) {
   const sample = findSample(id);
-  if (sample === undefined) {
-    return json(res, 404, { error: 'NO_SAMPLE', templateId: id });
-  }
+  if (sample === undefined) return json(res, 404, { error: 'NO_SAMPLE', templateId: id });
   return json(res, 200, { templateId: id, payload: sample });
 }
-
 function openApiStub() {
-  return {
-    openapi: '3.0.3',
-    info: { title: 'generate-template-server', version: config.version },
-    paths: Object.fromEntries(
-      ENDPOINTS.map((e) => [e.path, { [e.method.toLowerCase()]: { summary: e.desc } }]),
-    ),
-  };
+  return { openapi: '3.0.3', info: { title: 'generate-template-server', version: config.version }, paths: Object.fromEntries(ENDPOINTS.map((e) => [e.path, { [e.method.toLowerCase()]: { summary: e.desc } }])) };
 }
 
 const server = createServer(async (req, res) => {
@@ -357,98 +197,37 @@ const server = createServer(async (req, res) => {
   const reqId = req.headers['x-request-id'] || randomUUID();
   res.setHeader('x-request-id', reqId);
   inc('requests');
-
-  const finish = (status) => {
-    logRequest({
-      reqId,
-      method,
-      path: url.pathname,
-      status,
-      ms: Date.now() - start,
-    });
-  };
-
   const origEnd = res.end;
-  res.end = function (...args) {
-    finish(res.statusCode);
-    return origEnd.apply(this, args);
-  };
-
+  res.end = function (...args) { logRequest({ reqId, method, path: url.pathname, status: res.statusCode, ms: Date.now() - start }); return origEnd.apply(this, args); };
   if (method === 'OPTIONS') {
-    res.writeHead(204, {
-      'access-control-allow-origin': config.corsOrigin,
-      'access-control-allow-methods': 'GET,POST,OPTIONS',
-      'access-control-allow-headers': 'content-type,accept,authorization,x-api-key,x-request-id',
-    });
+    res.writeHead(204, { 'access-control-allow-origin': config.corsOrigin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,accept,authorization,x-api-key,x-request-id' });
     return res.end();
   }
-
-  if (method === 'GET' && url.pathname === '/health') {
-    return json(res, 200, {
-      ok: true,
-      service: 'generate-template-server',
-      version: config.version,
-      uptime: Math.floor((Date.now() - startedAt) / 1000),
-      catalogSource,
-    });
-  }
-  if (method === 'GET' && url.pathname === '/version') {
-    return json(res, 200, { version: config.version });
-  }
-  if (method === 'GET' && url.pathname === '/docs') {
-    return json(res, 200, { endpoints: ENDPOINTS, version: config.version });
-  }
-  if (method === 'GET' && url.pathname === '/openapi.json') {
-    return json(res, 200, openApiStub());
-  }
-
+  if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, service: 'generate-template-server', version: config.version, uptime: Math.floor((Date.now() - startedAt) / 1000), catalogSource: state.catalogSource });
+  if (method === 'GET' && url.pathname === '/version') return json(res, 200, { version: config.version });
+  if (method === 'GET' && url.pathname === '/docs') return json(res, 200, { endpoints: ENDPOINTS, version: config.version });
+  if (method === 'GET' && url.pathname === '/openapi.json') return json(res, 200, openApiStub());
   if (!isPublicPath(url.pathname) && !requireAuth(req, res)) return;
-
-  if (!checkRateLimit(req, res)) {
-    inc('rate_limited');
-    return;
-  }
-
+  if (!checkRateLimit(req, res)) { inc('rate_limited'); return; }
   const templateMatch = url.pathname.match(/^\/templates\/([^/]+)$/);
   if (method === 'GET' && templateMatch) return handleTemplateById(decodeURIComponent(templateMatch[1]), res);
-
   const sampleMatch = url.pathname.match(/^\/samples\/([^/]+)$/);
   if (method === 'GET' && sampleMatch) return handleSample(decodeURIComponent(sampleMatch[1]), res);
-
   if (method === 'GET' && url.pathname === '/templates') return handleTemplates(req, res);
-  if (method === 'GET' && url.pathname === '/metrics' && config.enableMetrics) {
-    return json(res, 200, snapshot());
-  }
-  if (method === 'GET' && url.pathname === '/recent' && config.enableRecent) {
-    return json(res, 200, { recent: recentList() });
-  }
+  if (method === 'GET' && url.pathname === '/metrics' && config.enableMetrics) return json(res, 200, snapshot());
+  if (method === 'GET' && url.pathname === '/recent' && config.enableRecent) return json(res, 200, { recent: recentList() });
+  if (method === 'POST' && url.pathname === '/reload') return handleReload(req, res, reqId);
   if (method === 'POST' && url.pathname === '/render') return handleRender(req, res, reqId);
   if (method === 'POST' && url.pathname === '/render-preview') return handleRenderPreview(req, res, reqId);
   if (method === 'POST' && url.pathname === '/render-many') return handleRenderMany(req, res, reqId);
   if (method === 'POST' && url.pathname === '/download') return handleDownload(req, res, reqId);
-
   return json(res, 404, { error: 'not_found', path: url.pathname, reqId });
 });
 
-init()
-  .then(() => {
-    server.listen(config.port, config.host, () => {
-      console.log(
-        `generate-template-server ${config.version} listening on http://${config.host}:${config.port} (catalog: ${catalogSource})`,
-      );
-    });
-  })
-  .catch((err) => {
-    console.error('Failed to start:', err);
-    process.exit(1);
-  });
-
-function shutdown() {
-  console.log('shutting down');
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
-}
+init().then(() => server.listen(config.port, config.host, () => {
+  console.log(`generate-template-server ${config.version} listening on http://${config.host}:${config.port} (catalog: ${state.catalogSource})`);
+})).catch((err) => { console.error('Failed to start:', err); process.exit(1); });
+function shutdown() { server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 5000).unref(); }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
-
 export { server };
