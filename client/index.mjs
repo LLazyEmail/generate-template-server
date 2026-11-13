@@ -36,7 +36,14 @@ export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {})
 
   return {
     health: () => request('/health'),
+    version: () => request('/version'),
+    docs: () => request('/docs'),
+    openapi: () => request('/openapi.json'),
     templates: () => request('/templates'),
+    template: (id) => request(`/templates/${encodeURIComponent(id)}`),
+    sample: (id) => request(`/samples/${encodeURIComponent(id)}`),
+    metrics: () => request('/metrics'),
+    recent: () => request('/recent'),
     render: (templateId, payload) =>
       request('/render', {
         method: 'POST',
@@ -47,11 +54,11 @@ export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {})
         method: 'POST',
         body: JSON.stringify({ templateId, payload }),
       }),
-    renderMany: (items, asJson = false) =>
+    renderMany: (items, { asJson = false, parallel = false } = {}) =>
       request('/render-many', {
         method: 'POST',
         headers: asJson ? { accept: 'application/json' } : {},
-        body: JSON.stringify({ items }),
+        body: JSON.stringify({ items, parallel }),
       }),
   };
 }

@@ -5,13 +5,16 @@
  * Endpoints:
  *   POST /render           { templateId, payload? } → JSON { html, ... }
  *   POST /render-preview   { templateId, payload? } → text/html (iframe)
- *   POST /render-many      { items: [...] }         → zip or JSON
+ *   POST /render-many      { items, parallel? }     → zip or JSON
  *   GET  /templates
- *   GET  /health
+ *   GET  /templates/:id    existence + sample presence
+ *   GET  /samples/:id      sample payload
+ *   GET  /health           { ok, version, uptime }
  *   GET  /version
- *   GET  /docs             machine-readable endpoint list
- *   GET  /metrics          counters (if enabled)
- *   GET  /recent           recent successful renders (if enabled)
+ *   GET  /docs
+ *   GET  /openapi.json     OpenAPI 3 stub
+ *   GET  /metrics
+ *   GET  /recent
  *
  * Generation stays in `@llazyemail/generate-template`.
  */
@@ -26,22 +29,28 @@ import { toHttpError } from './errors.mjs';
 import { config } from './config.mjs';
 import { inc, snapshot } from './metrics.mjs';
 import { record, list as recentList } from './recent.mjs';
+import { withTimeout } from './timeout.mjs';
+import { logRequest, logError } from './logger.mjs';
 
+const startedAt = Date.now();
 const generate = createGenerator({
   catalog: demoCatalog,
   samplePayloads,
 });
 
 const ENDPOINTS = [
-  { method: 'GET', path: '/health', auth: false, desc: 'liveness' },
+  { method: 'GET', path: '/health', auth: false, desc: 'liveness + uptime' },
   { method: 'GET', path: '/version', auth: false, desc: 'package version' },
-  { method: 'GET', path: '/docs', auth: false, desc: 'this list' },
+  { method: 'GET', path: '/docs', auth: false, desc: 'endpoint list' },
+  { method: 'GET', path: '/openapi.json', auth: false, desc: 'OpenAPI 3 stub' },
   { method: 'GET', path: '/templates', auth: true, desc: 'catalog ids' },
+  { method: 'GET', path: '/templates/:id', auth: true, desc: 'exists + hasSample' },
+  { method: 'GET', path: '/samples/:id', auth: true, desc: 'sample payload' },
   { method: 'GET', path: '/metrics', auth: true, desc: 'counters' },
   { method: 'GET', path: '/recent', auth: true, desc: 'recent renders' },
   { method: 'POST', path: '/render', auth: true, desc: 'JSON HTML' },
   { method: 'POST', path: '/render-preview', auth: true, desc: 'raw HTML for iframe' },
-  { method: 'POST', path: '/render-many', auth: true, desc: 'zip or JSON list' },
+  { method: 'POST', path: '/render-many', auth: true, desc: 'zip or JSON; optional parallel' },
 ];
 
 function json(res, status, body, extra = {}) {
@@ -88,15 +97,24 @@ async function readBody(req) {
 }
 
 async function runOne(templateId, payload) {
-  const result = await generate.run({ templateId, payload });
+  const result = await withTimeout(
+    generate.run({ templateId, payload }),
+    `render ${templateId}`,
+  );
   inc('renders');
   return result;
 }
 
-function contentTypeFor(result, accept) {
-  if (accept?.includes('text/markdown') && result.markdown) return 'text/markdown';
-  if (accept?.includes('text/plain') && result.text) return 'text/plain';
-  return 'application/json';
+function findSample(id) {
+  const key = Object.keys(samplePayloads).find(
+    (k) => k.toLowerCase() === String(id).toLowerCase(),
+  );
+  return key ? samplePayloads[key] : undefined;
+}
+
+function templateExists(id) {
+  const lower = String(id).toLowerCase();
+  return demoCatalog.some((c) => c.ids.some((i) => i.toLowerCase() === lower));
 }
 
 async function handleRender(req, res, reqId) {
@@ -114,25 +132,15 @@ async function handleRender(req, res, reqId) {
   try {
     const result = await runOne(templateId, body.payload);
     record({ templateId, reqId, slug: result.slug });
-    const payload = {
+    return json(res, 200, {
       templateId: result.templateId ?? templateId,
       html: result.html,
       slug: result.slug,
       reqId,
-    };
-    const accept = String(req.headers.accept || '');
-    const ct = contentTypeFor(result, accept);
-    if (ct === 'text/markdown' && result.markdown) {
-      res.writeHead(200, {
-        'content-type': 'text/markdown; charset=utf-8',
-        'access-control-allow-origin': config.corsOrigin,
-        'x-request-id': reqId,
-      });
-      return res.end(result.markdown);
-    }
-    return json(res, 200, payload);
+    });
   } catch (err) {
     inc('render_errors');
+    logError({ reqId, templateId, error: err?.message, code: err?.code });
     const { status, body: errBody } = toHttpError(err);
     return json(res, status, { ...errBody, reqId });
   }
@@ -173,21 +181,24 @@ async function handleRenderMany(req, res, reqId) {
   const items = Array.isArray(body.items) ? body.items : [];
   if (items.length === 0) return json(res, 400, { error: 'items_required', reqId });
 
-  const rendered = [];
-  for (const item of items) {
-    if (!item?.templateId) continue;
-    try {
+  const tasks = items
+    .filter((item) => item?.templateId)
+    .map(async (item) => {
       const result = await runOne(item.templateId, item.payload);
-      rendered.push({
+      record({ templateId: item.templateId, reqId, slug: result.slug });
+      return {
         name: `${result.slug ?? item.templateId}.html`,
         html: result.html,
-      });
-      record({ templateId: item.templateId, reqId, slug: result.slug });
-    } catch (err) {
-      inc('render_errors');
-      const { status, body: errBody } = toHttpError(err);
-      return json(res, status, { ...errBody, templateId: item.templateId, reqId });
-    }
+      };
+    });
+
+  let rendered;
+  try {
+    rendered = body.parallel ? await Promise.all(tasks) : await sequential(tasks);
+  } catch (err) {
+    inc('render_errors');
+    const { status, body: errBody } = toHttpError(err);
+    return json(res, status, { ...errBody, reqId });
   }
 
   const accept = String(req.headers.accept || '');
@@ -214,17 +225,68 @@ async function handleRenderMany(req, res, reqId) {
   inc('zips');
 }
 
+async function sequential(tasks) {
+  const out = [];
+  for (const t of tasks) out.push(await t);
+  return out;
+}
+
 function handleTemplates(_req, res) {
   const ids = demoCatalog.flatMap((c) => c.ids);
   return json(res, 200, { templates: ids, samples: Object.keys(samplePayloads) });
 }
 
+function handleTemplateById(id, res) {
+  const exists = templateExists(id);
+  if (!exists) return json(res, 404, { error: 'UNKNOWN_TEMPLATE', templateId: id });
+  return json(res, 200, {
+    templateId: id,
+    exists: true,
+    hasSample: findSample(id) !== undefined,
+  });
+}
+
+function handleSample(id, res) {
+  const sample = findSample(id);
+  if (sample === undefined) {
+    return json(res, 404, { error: 'NO_SAMPLE', templateId: id });
+  }
+  return json(res, 200, { templateId: id, payload: sample });
+}
+
+function openApiStub() {
+  return {
+    openapi: '3.0.3',
+    info: { title: 'generate-template-server', version: config.version },
+    paths: Object.fromEntries(
+      ENDPOINTS.map((e) => [e.path, { [e.method.toLowerCase()]: { summary: e.desc } }]),
+    ),
+  };
+}
+
 const server = createServer(async (req, res) => {
+  const start = Date.now();
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
   const method = req.method || 'GET';
   const reqId = req.headers['x-request-id'] || randomUUID();
   res.setHeader('x-request-id', reqId);
   inc('requests');
+
+  const finish = (status) => {
+    logRequest({
+      reqId,
+      method,
+      path: url.pathname,
+      status,
+      ms: Date.now() - start,
+    });
+  };
+
+  const origEnd = res.end;
+  res.end = function (...args) {
+    finish(res.statusCode);
+    return origEnd.apply(this, args);
+  };
 
   if (method === 'OPTIONS') {
     res.writeHead(204, {
@@ -236,7 +298,12 @@ const server = createServer(async (req, res) => {
   }
 
   if (method === 'GET' && url.pathname === '/health') {
-    return json(res, 200, { ok: true, service: 'generate-template-server', version: config.version });
+    return json(res, 200, {
+      ok: true,
+      service: 'generate-template-server',
+      version: config.version,
+      uptime: Math.floor((Date.now() - startedAt) / 1000),
+    });
   }
   if (method === 'GET' && url.pathname === '/version') {
     return json(res, 200, { version: config.version });
@@ -244,11 +311,20 @@ const server = createServer(async (req, res) => {
   if (method === 'GET' && url.pathname === '/docs') {
     return json(res, 200, { endpoints: ENDPOINTS, version: config.version });
   }
+  if (method === 'GET' && url.pathname === '/openapi.json') {
+    return json(res, 200, openApiStub());
+  }
 
   if (!checkRateLimit(req, res)) {
     inc('rate_limited');
     return;
   }
+
+  const templateMatch = url.pathname.match(/^\/templates\/([^/]+)$/);
+  if (method === 'GET' && templateMatch) return handleTemplateById(decodeURIComponent(templateMatch[1]), res);
+
+  const sampleMatch = url.pathname.match(/^\/samples\/([^/]+)$/);
+  if (method === 'GET' && sampleMatch) return handleSample(decodeURIComponent(sampleMatch[1]), res);
 
   if (method === 'GET' && url.pathname === '/templates') return handleTemplates(req, res);
   if (method === 'GET' && url.pathname === '/metrics' && config.enableMetrics) {
