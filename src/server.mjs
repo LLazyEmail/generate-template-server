@@ -9,19 +9,20 @@
  *   GET  /templates        list available template ids
  *   GET  /health           { ok: true }
  *
- * The generation contract is exactly `@llazyemail/generate-template` `run()`.
- * This process only handles HTTP, auth hooks, and zip packaging.
+ * Generation stays in `@llazyemail/generate-template`.
+ * This process handles HTTP, optional rate limiting, and stable error mapping.
  */
 
 import { createServer } from 'node:http';
 import { createGenerator } from '@llazyemail/generate-template';
 import archiver from 'archiver';
 import { demoCatalog, samplePayloads } from './catalog.mjs';
+import { checkRateLimit } from './rate-limit.mjs';
+import { toHttpError } from './errors.mjs';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? '0.0.0.0';
 
-// In a real deployment this comes from a project config or mounted module.
 const generate = createGenerator({
   catalog: demoCatalog,
   samplePayloads,
@@ -77,12 +78,8 @@ async function handleRender(req, res) {
       slug: result.slug,
     });
   } catch (err) {
-    const code = err?.code ?? 'RENDER_FAILED';
-    const status = code === 'UNKNOWN_TEMPLATE' ? 404 : 422;
-    return json(res, status, {
-      error: code,
-      message: err?.message ?? String(err),
-    });
+    const { status, body: errBody } = toHttpError(err);
+    return json(res, status, errBody);
   }
 }
 
@@ -121,11 +118,8 @@ async function handleRenderMany(req, res) {
         html: result.html,
       });
     } catch (err) {
-      return json(res, 422, {
-        error: err?.code ?? 'RENDER_FAILED',
-        templateId: item.templateId,
-        message: err?.message ?? String(err),
-      });
+      const { status, body: errBody } = toHttpError(err);
+      return json(res, status, { ...errBody, templateId: item.templateId });
     }
   }
 
@@ -172,6 +166,9 @@ const server = createServer(async (req, res) => {
   if (method === 'GET' && url.pathname === '/health') {
     return json(res, 200, { ok: true, service: 'generate-template-server' });
   }
+
+  if (!checkRateLimit(req, res)) return;
+
   if (method === 'GET' && url.pathname === '/templates') {
     return handleTemplates(req, res);
   }
