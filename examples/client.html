@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>generate-template-server client</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; }
+    label { display: block; margin-top: 1rem; }
+    input, textarea, button { width: 100%; font: inherit; }
+    pre { background: #f4f4f4; padding: 1rem; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>generate-template-server client</h1>
+  <p>Point this at a running server (default http://localhost:8787). Set API key if required.</p>
+
+  <label>Server URL
+    <input id="base" value="http://localhost:8787">
+  </label>
+  <label>API key (optional)
+    <input id="key" type="password" placeholder="leave empty if none">
+  </label>
+  <label>Template ID
+    <input id="tid" value="welcome">
+  </label>
+  <label>Payload (JSON)
+    <textarea id="payload" rows="4">{"name":"Alex"}</textarea>
+  </label>
+
+  <button id="preview">Preview</button>
+  <button id="zip">Download zip</button>
+
+  <h2>Result</h2>
+  <pre id="out">(none yet)</pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function headers() {
+      const h = { 'content-type': 'application/json' };
+      const key = $('key').value.trim();
+      if (key) h['Authorization'] = 'Bearer ' + key;
+      return h;
+    }
+    $('preview').onclick = async () => {
+      try {
+        const res = await fetch($('base').value + '/render', {
+          method: 'POST',
+          headers: headers(),
+          body: JSON.stringify({
+            templateId: $('tid').value.trim(),
+            payload: JSON.parse($('payload').value || '{}'),
+          }),
+        });
+        const data = await res.json();
+        $('out').textContent = data.html || JSON.stringify(data, null, 2);
+      } catch (e) {
+        $('out').textContent = String(e);
+      }
+    };
+    $('zip').onclick = async () => {
+      const res = await fetch($('base').value + '/render-many', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          items: [{ templateId: $('tid').value.trim(), payload: JSON.parse($('payload').value || '{}') }],
+        }),
+      });
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'artifacts.zip';
+      a.click();
+    };
+  </script>
+</body>
+</html>
