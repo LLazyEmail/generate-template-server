@@ -36,13 +36,11 @@ jobs:
       - name: Install public dependencies only (fallback)
         if: steps.install.outcome == 'failure'
         run: |
-          # Private package is not readable by this repo's GITHUB_TOKEN.
-          # Install only the public deps so pure unit tests can still run.
           npm install archiver --no-save
-          echo "Note: @llazyemail/generate-template is private. Grant this repo Actions access on the package for full tests."
+          echo "::warning::@llazyemail/generate-template is not readable by this repo's GITHUB_TOKEN. Grant Actions access on the package for full tests. See docs/ci-packages.md"
 
-      - name: Run pure unit tests (always)
-        run: node --test src/download.test.mjs src/body-limit.test.mjs src/*.test.mjs --test-name-pattern='buildIndex|timeout|sample' || node --test src/download.test.mjs
+      - name: Run pure unit tests
+        run: npm run test:ci
 
       - name: Run full tests (when private package is available)
         if: steps.install.outcome == 'success'
