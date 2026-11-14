@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Thin callable HTTP server.
- * Adds POST /reload to hot-reload the catalog without restart.
+ * Adds GET /ready for load balancers.
  */
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
@@ -18,6 +18,7 @@ import { loadCatalog } from './load-catalog.mjs';
 import { requireAuth, isPublicPath } from './auth.mjs';
 import { buildIndex, sendZip } from './download.mjs';
 import { reloadCatalog } from './reload.mjs';
+import { isReady, readyBody } from './ready.mjs';
 
 const startedAt = Date.now();
 const state = { generate: null, catalog: [], samplePayloads: {}, catalogSource: 'loading' };
@@ -28,6 +29,7 @@ async function init() {
 
 const ENDPOINTS = [
   { method: 'GET', path: '/health', auth: false, desc: 'liveness + uptime' },
+  { method: 'GET', path: '/ready', auth: false, desc: 'readiness (catalog loaded)' },
   { method: 'GET', path: '/version', auth: false, desc: 'package version' },
   { method: 'GET', path: '/docs', auth: false, desc: 'endpoint list' },
   { method: 'GET', path: '/openapi.json', auth: false, desc: 'OpenAPI 3 stub' },
@@ -202,6 +204,10 @@ const server = createServer(async (req, res) => {
   if (method === 'OPTIONS') {
     res.writeHead(204, { 'access-control-allow-origin': config.corsOrigin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,accept,authorization,x-api-key,x-request-id' });
     return res.end();
+  }
+  if (method === 'GET' && url.pathname === '/ready') {
+    const ok = isReady(state);
+    return json(res, ok ? 200 : 503, readyBody(state));
   }
   if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, service: 'generate-template-server', version: config.version, uptime: Math.floor((Date.now() - startedAt) / 1000), catalogSource: state.catalogSource });
   if (method === 'GET' && url.pathname === '/version') return json(res, 200, { version: config.version });
