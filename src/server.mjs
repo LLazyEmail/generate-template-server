@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Thin callable HTTP server.
- * Adds POST /reload to hot-reload the catalog without restart.
+ * Adds GET /demo that serves examples/client.html.
  */
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
@@ -18,6 +18,7 @@ import { loadCatalog } from './load-catalog.mjs';
 import { requireAuth, isPublicPath } from './auth.mjs';
 import { buildIndex, sendZip } from './download.mjs';
 import { reloadCatalog } from './reload.mjs';
+import { serveDemo } from './static.mjs';
 
 const startedAt = Date.now();
 const state = { generate: null, catalog: [], samplePayloads: {}, catalogSource: 'loading' };
@@ -31,6 +32,7 @@ const ENDPOINTS = [
   { method: 'GET', path: '/version', auth: false, desc: 'package version' },
   { method: 'GET', path: '/docs', auth: false, desc: 'endpoint list' },
   { method: 'GET', path: '/openapi.json', auth: false, desc: 'OpenAPI 3 stub' },
+  { method: 'GET', path: '/demo', auth: false, desc: 'browser client example' },
   { method: 'GET', path: '/templates', auth: true, desc: 'catalog ids' },
   { method: 'GET', path: '/templates/:id', auth: true, desc: 'exists + hasSample' },
   { method: 'GET', path: '/samples/:id', auth: true, desc: 'sample payload' },
@@ -203,6 +205,7 @@ const server = createServer(async (req, res) => {
     res.writeHead(204, { 'access-control-allow-origin': config.corsOrigin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,accept,authorization,x-api-key,x-request-id' });
     return res.end();
   }
+  if (method === 'GET' && url.pathname === '/demo') return serveDemo(res, config.corsOrigin);
   if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, service: 'generate-template-server', version: config.version, uptime: Math.floor((Date.now() - startedAt) / 1000), catalogSource: state.catalogSource });
   if (method === 'GET' && url.pathname === '/version') return json(res, 200, { version: config.version });
   if (method === 'GET' && url.pathname === '/docs') return json(res, 200, { endpoints: ENDPOINTS, version: config.version });
