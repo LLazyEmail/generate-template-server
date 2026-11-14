@@ -29,15 +29,58 @@ It does **not** own:
 7. **Tests matter.** New endpoints need at least a unit or integration assertion.
 8. **No secrets in repo.** `.npmrc`, API keys, and tokens stay in env or GitHub secrets.
 
+## Working style (AI agents)
+
+These rules exist because a single growing file becomes unreviewable and unmergeable.
+
+### Always use feature branches
+
+- Never commit directly to `main`.
+- One concern per branch. Name it `feat/`, `fix/`, or `docs/`.
+- Open a pull request. Do not batch unrelated changes into one PR.
+- Base the branch on current `main`. If the branch goes dirty, rebase or recreate it from `main` instead of stacking more commits on a diverged history.
+
+### Write like a software developer
+
+- Small, focused modules. One responsibility per file.
+- Clear names. No god objects, no 400-line handlers mixed with routing and helpers.
+- Additive changes. Prefer a new module over editing a large file for a new feature.
+- Keep the public surface stable. Internal structure can change freely if the HTTP contract does not.
+
+### Do not put all changes into one file
+
+- `src/server.mjs` is an entry point. It should stay short (init, listen, shutdown, wiring).
+- HTTP helpers go in `src/http.mjs`.
+- Request handlers go in `src/handlers.mjs` (or a domain-specific handler file).
+- Route table and dispatch go in `src/router.mjs`.
+- A new feature gets its own module (`src/static.mjs`, `src/ready.mjs`, `src/cache.mjs`, …) and a thin wire-up.
+
+### When a file keeps changing, reorganize
+
+If the same file is edited in most pull requests, that is a signal to split it.
+
+- Extract the part that changes most into its own module.
+- Leave the stable wiring in the entry point.
+- Prefer composition over a growing switch or if-else chain.
+- After a split, update this table so the next agent knows where to put things.
+
 ## Where to put things
 
 | Concern | Location |
 |---------|----------|
-| HTTP routing & handlers | `src/server.mjs` |
-| Catalog loading | `src/load-catalog.mjs` (or equivalent) |
+| Entry (init, listen, shutdown) | `src/server.mjs` |
+| HTTP helpers (json, html, readBody) | `src/http.mjs` |
+| Request handlers | `src/handlers.mjs` (or domain file) |
+| Route table and dispatch | `src/router.mjs` |
+| Catalog loading | `src/load-catalog.mjs` |
+| Catalog hot-reload | `src/reload.mjs` |
 | Auth | `src/auth.mjs` |
 | Rate limit | `src/rate-limit.mjs` |
 | Error mapping | `src/errors.mjs` |
+| Download / zip | `src/download.mjs` |
+| Static demo page | `src/static.mjs` |
+| Readiness | `src/ready.mjs` |
+| Render cache | `src/cache.mjs` |
 | Client SDK | `client/` |
 | Browser example | `examples/client.html` |
 | AI / contributor rules | `AGENTS.md` (this file) |
@@ -45,11 +88,13 @@ It does **not** own:
 
 ## When you add an endpoint
 
-1. Document it in the README table.
-2. Add a one-line description to the `/docs` endpoint if it exists.
-3. Decide if it should be rate-limited and auth-protected (default: yes).
-4. Return a `reqId` on errors.
-5. Prefer JSON unless the consumer is an iframe (`/render-preview`).
+1. Put the handler in its own module or in `handlers.mjs`.
+2. Register the route in `router.mjs`.
+3. Document it in the README table.
+4. Add a one-line description to the `/docs` endpoint if it exists.
+5. Decide if it should be rate-limited and auth-protected (default: yes).
+6. Return a `reqId` on errors.
+7. Prefer JSON unless the consumer is an iframe (`/render-preview`).
 
 ## Related repos
 
