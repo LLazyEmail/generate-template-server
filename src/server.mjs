@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Thin callable HTTP server.
- * Adds GET /demo that serves examples/client.html.
+ * Optional render cache when RENDER_CACHE=1.
  */
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
@@ -19,6 +19,7 @@ import { requireAuth, isPublicPath } from './auth.mjs';
 import { buildIndex, sendZip } from './download.mjs';
 import { reloadCatalog } from './reload.mjs';
 import { serveDemo } from './static.mjs';
+import { cacheGet, cacheSet, cacheStats } from './cache.mjs';
 
 const startedAt = Date.now();
 const state = { generate: null, catalog: [], samplePayloads: {}, catalogSource: 'loading' };
@@ -33,6 +34,7 @@ const ENDPOINTS = [
   { method: 'GET', path: '/docs', auth: false, desc: 'endpoint list' },
   { method: 'GET', path: '/openapi.json', auth: false, desc: 'OpenAPI 3 stub' },
   { method: 'GET', path: '/demo', auth: false, desc: 'browser client example' },
+  { method: 'GET', path: '/cache', auth: true, desc: 'render cache stats' },
   { method: 'GET', path: '/templates', auth: true, desc: 'catalog ids' },
   { method: 'GET', path: '/templates/:id', auth: true, desc: 'exists + hasSample' },
   { method: 'GET', path: '/samples/:id', auth: true, desc: 'sample payload' },
@@ -82,7 +84,13 @@ async function readBody(req) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
 }
 async function runOne(templateId, payload) {
+  const hit = cacheGet(templateId, payload);
+  if (hit) {
+    inc('cache_hits');
+    return hit;
+  }
   const result = await withTimeout(state.generate.run({ templateId, payload }), `render ${templateId}`);
+  cacheSet(templateId, payload, result);
   inc('renders');
   return result;
 }
@@ -206,12 +214,13 @@ const server = createServer(async (req, res) => {
     return res.end();
   }
   if (method === 'GET' && url.pathname === '/demo') return serveDemo(res, config.corsOrigin);
-  if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, service: 'generate-template-server', version: config.version, uptime: Math.floor((Date.now() - startedAt) / 1000), catalogSource: state.catalogSource });
+  if (method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, service: 'generate-template-server', version: config.version, uptime: Math.floor((Date.now() - startedAt) / 1000), catalogSource: state.catalogSource, cache: cacheStats() });
   if (method === 'GET' && url.pathname === '/version') return json(res, 200, { version: config.version });
   if (method === 'GET' && url.pathname === '/docs') return json(res, 200, { endpoints: ENDPOINTS, version: config.version });
   if (method === 'GET' && url.pathname === '/openapi.json') return json(res, 200, openApiStub());
   if (!isPublicPath(url.pathname) && !requireAuth(req, res)) return;
   if (!checkRateLimit(req, res)) { inc('rate_limited'); return; }
+  if (method === 'GET' && url.pathname === '/cache') return json(res, 200, cacheStats());
   const templateMatch = url.pathname.match(/^\/templates\/([^/]+)$/);
   if (method === 'GET' && templateMatch) return handleTemplateById(decodeURIComponent(templateMatch[1]), res);
   const sampleMatch = url.pathname.match(/^\/samples\/([^/]+)$/);
