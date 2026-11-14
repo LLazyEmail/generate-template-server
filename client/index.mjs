@@ -5,6 +5,7 @@
  *   import { createClient } from './client/index.mjs';
  *   const client = createClient({ baseUrl: 'http://localhost:8787', apiKey: '...' });
  *   const { html } = await client.render('welcome', { name: 'Alex' });
+ *   const blob = await client.download({ all: true });
  */
 
 export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {}) {
@@ -59,6 +60,15 @@ export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {})
         method: 'POST',
         headers: asJson ? { accept: 'application/json' } : {},
         body: JSON.stringify({ items, parallel }),
+      }),
+    /**
+     * POST /download — returns a Blob (zip).
+     * opts: { items?, templateIds?, all?, includeIndex?, artifactName?, productName? }
+     */
+    download: (opts = {}) =>
+      request('/download', {
+        method: 'POST',
+        body: JSON.stringify(opts),
       }),
   };
 }
