@@ -19,6 +19,19 @@ jobs:
         with:
           node-version: '22'
 
+      - name: 90-line limit
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r f; do
+            n=$(wc -l < "$f")
+            if [ "$n" -gt 90 ]; then
+              echo "::error file=$f::over 90 lines ($n)"
+              fail=1
+            fi
+          done < <(find src -name '*.mjs' -not -name '*.test.mjs')
+          exit $fail
+
       - name: Configure GitHub Packages auth
         run: |
           echo "@llazyemail:registry=https://npm.pkg.github.com" >> .npmrc
@@ -35,7 +48,6 @@ jobs:
         if: steps.install.outcome == 'failure'
         run: |
           echo "::warning::@llazyemail/generate-template is not readable by this repo's GITHUB_TOKEN. Running pure unit tests only. See docs/ci-packages.md"
-          # Isolate so npm does not try to resolve the private package
           mv package.json package.json.orig
           cat > package.json << 'EOF'
           { "type": "module", "dependencies": { "archiver": "^7.0.1" } }
