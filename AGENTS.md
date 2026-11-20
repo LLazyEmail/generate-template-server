@@ -30,6 +30,28 @@ It does **not** own:
 8. **No secrets in repo.** `.npmrc`, API keys, and tokens stay in env or GitHub secrets.
 9. **No file over 90 lines.** If a file is about to cross 90 lines, split it. This is a hard limit for `src/**/*.mjs`. Documentation and generated files are exempt.
 
+## Before you open a PR (CI will fail otherwise)
+
+CI runs a 90-line check on every non-test file under `src/`:
+
+```bash
+find src -name '*.mjs' -not -name '*.test.mjs' -exec sh -c 'n=$(wc -l < "$1"); [ "$n" -le 90 ] || echo "$1 $n"' _ {} \;
+```
+
+**Do this before opening the PR.** If any file prints a number over 90, CI fails with:
+
+```
+::error file=src/handlers/meta.mjs::over 90 lines (94)
+```
+
+Rules:
+
+- Count lines with `wc -l`. Do not guess.
+- Test files (`*.test.mjs`) are exempt. Everything else in `src/**/*.mjs` is not.
+- If a file is at 85 or more, split it now. Do not open the PR and fix it later.
+- Split by extracting a domain into a new file and re-exporting from the barrel.
+- Opening a PR with a file over 90 lines is a broken PR. Do not do it.
+
 ## Working style (AI agents)
 
 These rules exist because a single growing file becomes unreviewable and unmergeable.
@@ -78,7 +100,8 @@ If the same file is edited in most pull requests, that is a signal to split it.
 | Render handlers | `src/handlers/render.mjs` |
 | Multi-render | `src/handlers/many.mjs` |
 | Download handler | `src/handlers/download.mjs` |
-| Meta handlers (health, docs, catalog) | `src/handlers/meta.mjs` |
+| Catalog handlers | `src/handlers/catalog.mjs` |
+| Meta handlers (health, docs) | `src/handlers/meta.mjs` |
 | Shared state | `src/state.mjs` |
 | Endpoint list | `src/endpoints.mjs` |
 | Single render + cache | `src/run.mjs` |
@@ -108,6 +131,7 @@ If the same file is edited in most pull requests, that is a signal to split it.
 6. Decide if it should be rate-limited and auth-protected (default: yes).
 7. Return a `reqId` on errors.
 8. Prefer JSON unless the consumer is an iframe (`/render-preview`).
+9. Run the 90-line check above before you open the PR.
 
 ## Related repos
 
