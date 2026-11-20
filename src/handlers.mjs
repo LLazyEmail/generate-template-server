@@ -14,6 +14,8 @@ export {
   handleTemplates,
   handleTemplateById,
   handleSample,
+} from './handlers/catalog.mjs';
+export {
   handleHealth,
   handleReady,
   handleCache,
