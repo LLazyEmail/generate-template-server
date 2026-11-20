@@ -37,6 +37,7 @@ export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {})
 
   return {
     health: () => request('/health'),
+    ready: () => request('/ready'),
     version: () => request('/version'),
     docs: () => request('/docs'),
     openapi: () => request('/openapi.json'),
@@ -45,6 +46,7 @@ export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {})
     sample: (id) => request(`/samples/${encodeURIComponent(id)}`),
     metrics: () => request('/metrics'),
     recent: () => request('/recent'),
+    cache: () => request('/cache'),
     render: (templateId, payload) =>
       request('/render', {
         method: 'POST',
@@ -61,10 +63,6 @@ export function createClient({ baseUrl = 'http://localhost:8787', apiKey } = {})
         headers: asJson ? { accept: 'application/json' } : {},
         body: JSON.stringify({ items, parallel }),
       }),
-    /**
-     * POST /download — returns a Blob (zip).
-     * opts: { items?, templateIds?, all?, includeIndex?, artifactName?, productName? }
-     */
     download: (opts = {}) =>
       request('/download', {
         method: 'POST',
