@@ -16,8 +16,9 @@ trap cleanup EXIT
 node src/server.mjs >"$OUT/server.log" 2>&1 &
 PID=$!
 
+ready=0
 for i in $(seq 1 30); do
-  if curl -sf "$BASE/ready" >/dev/null; then break; fi
+  if curl -sf "$BASE/ready" >/dev/null; then ready=1; break; fi
   if ! kill -0 "$PID" 2>/dev/null; then
     echo "::error::server exited before ready"
     cat "$OUT/server.log"
@@ -25,6 +26,11 @@ for i in $(seq 1 30); do
   fi
   sleep 1
 done
+if [[ "$ready" != 1 ]]; then
+  echo "::error::server not ready after 30s"
+  cat "$OUT/server.log"
+  exit 1
+fi
 curl -sf "$BASE/ready" | tee "$OUT/ready.json"
 
 render() {
@@ -46,13 +52,15 @@ render invoice '{"id":"INV-CI","amount":99}' invoice.html 'Amount: 99'
 
 curl -sf "$BASE/health" | tee "$OUT/health.json"
 
-{
-  echo "### Generated templates"
-  echo ""
-  echo "- \"welcome.html\" contains \"Welcome, CI\""
-  echo "- \"invoice.html\" contains \"Amount: 99\""
-  echo ""
-  echo "Download the artifacts from this run to open the HTML."
-} >> "$GITHUB_STEP_SUMMARY"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    echo "### Generated templates"
+    echo ""
+    echo "- welcome.html contains \"Welcome, CI\""
+    echo "- invoice.html contains \"Amount: 99\""
+    echo ""
+    echo "Download the artifacts from this run to open the HTML."
+  } >> "$GITHUB_STEP_SUMMARY"
+fi
 
 echo "generated $(wc -c < "$OUT/welcome.html") bytes welcome.html"
