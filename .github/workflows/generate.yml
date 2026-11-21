@@ -1,0 +1,44 @@
+name: Generate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure GitHub Packages auth
+        run: |
+          echo "@llazyemail:registry=https://npm.pkg.github.com" >> .npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> .npmrc
+
+      - name: Install dependencies
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm install
+
+      - name: Start server and render real templates
+        env:
+          PORT: '8787'
+        run: bash scripts/ci-render.sh
+
+      - name: Upload generated HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-templates
+          path: artifacts/
+          if-no-files-found: error
